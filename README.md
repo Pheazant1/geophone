@@ -112,6 +112,8 @@ speed, and three independent time differences fix the position inside the array.
 | `signal_processor.py`   | Zero-phase Butterworth bandpass (10 to 50 Hz) and an adaptive rolling-median threshold per channel, then groups threshold crossings on the array-averaged envelope into activity windows and tags each with the strongest channel. |
 | `localizer.py`          | Measures time differences of arrival by cross-correlation, solves for the source position by grid search, and resolves a heading and speed for events that move far enough. |
 | `profile_classifier.py` | Extracts features, classifies the source, range-corrects mass, matches against saved profiles, picks the covering camera and emits the JSON alert webhook. |
+| `pattern_memory.py`     | The self-learning core: an unsupervised pattern memory that clusters recurring feature vectors into profiles, confirms the ones that repeat, and flags anything novel. Carries no labels and no built-in idea of what a human or vehicle is. |
+| `v1_demo.py`            | Wires the physics stack into `pattern_memory.py` and runs the label-free learning demonstration: a site is learned from scratch, then guarded, recognising its regulars and alerting on unseen signatures. |
 
 ## Quickstart
 
@@ -153,6 +155,47 @@ The system suppresses the two recognised events and raises two alerts: one for
 the unknown pedestrian, localised in the south-east with a north-west heading,
 and one for the registered vehicle returning to the gate with extra load on its
 trailing axle. Each alert names the camera covering its location.
+
+## Self-learning mode (label-free)
+
+The rule-based decision engine above knows in advance what a human and a vehicle
+look like. The self-learning mode does the opposite: it starts from a blank
+slate, with no labels and no training data, and learns the regulars at a site
+the way a music-identification app learns songs. It is a general tool for
+research, conservation and monitoring, where the question is not "is this
+allowed" but "have I seen this before".
+
+Each detected event is reduced to a compact, label-free signature: a
+range-corrected amplitude (how large the source is), the dominant frequency and
+low-frequency ratio (its contact texture), and a robust cadence recovered from
+the envelope modulation spectrum (its gait or axle rhythm). The pattern memory
+in `pattern_memory.py` then does three things, with nothing but running means
+and a distance measure whose per-feature scale is the natural repeatability of
+each feature:
+
+- Remembers new signatures as tentative profiles.
+- Confirms the ones that recur. A profile seen enough times is enrolled; a
+  one-off oddity stays tentative and is treated as noise.
+- Recognises and flags. Once trained, an event matching an enrolled signature
+  is recognised; one that matches nothing is novel and worth attention.
+
+```bash
+python v1_demo.py
+```
+
+The demonstration runs two phases against one growing memory. In the learning
+phase a stream of routine traffic arrives, three recurring sources plus a
+one-off animal, and the memory clusters them with no prior knowledge into three
+enrolled signatures, leaving the animal tentative. In the guarding phase the
+three regulars return and are recognised and suppressed, while two never-seen
+sources, an unfamiliar walker and an unfamiliar vehicle, are each flagged as a
+novel signature. The run prints the distance behind every decision and, for the
+demonstration only, checks each learned cluster against the simulator ground
+truth to confirm that one cluster corresponds to one real source.
+
+There is no neural network and no labelled data anywhere in this mode: the
+learning is interpretable statistical pattern memory, which is what lets it run
+on the same low-cost edge hardware and have every match be explainable.
 
 ## Example alert
 
@@ -227,6 +270,8 @@ geophone/
   signal_processor.py    filtering, adaptive baseline, event detection
   localizer.py           TDOA localisation, heading and speed
   profile_classifier.py  features, classification, profiles, JSON alerts
+  pattern_memory.py      unsupervised self-learning pattern memory
+  v1_demo.py             label-free learning and guarding demonstration
   requirements.txt       numpy, scipy
   README.md              this document
 ```

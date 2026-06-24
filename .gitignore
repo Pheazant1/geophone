@@ -69,3 +69,6 @@ logs/
 sample_feed.csv
 *.npy
 *.npz
+
+# Saved sandbox sessions
+sessions/

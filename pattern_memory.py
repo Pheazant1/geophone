@@ -222,6 +222,46 @@ class PatternMemory:
         return MatchResult(recognised=False, profile_id=None, distance=dist,
                            closest_id=nearest.profile_id)
 
+    # -- maintenance -------------------------------------------------------
+
+    def consolidate(self) -> List[Tuple[str, str]]:
+        """Merge enrolled profiles that turned out to describe the same source.
+
+        Occasionally one source founds a second profile, when an early, noisy
+        sighting lands just past the match threshold before the profile mean has
+        settled. As both profiles accumulate observations their means converge,
+        so a pair describing one source ends up within ``match_distance`` of each
+        other. Merging such pairs repairs the split. This is safe: two genuinely
+        different sources are always farther apart than ``match_distance`` (that
+        is why they became separate profiles), so distinct characters are never
+        fused.
+
+        Returns the list of (removed_id, kept_id) merges performed, so a caller
+        tracking per-profile statistics can fold them together too.
+        """
+        merges: List[Tuple[str, str]] = []
+        changed = True
+        while changed:
+            changed = False
+            enrolled = [p for p in self.profiles if p.enrolled]
+            for i in range(len(enrolled)):
+                for j in range(i + 1, len(enrolled)):
+                    keep, drop = enrolled[i], enrolled[j]
+                    if self._distance(keep.mean, drop.mean) <= self.match_distance:
+                        total = keep.count + drop.count
+                        keep.mean = (keep.mean * keep.count
+                                     + drop.mean * drop.count) / total
+                        keep.count = total
+                        keep.first_seen_s = min(keep.first_seen_s, drop.first_seen_s)
+                        keep.last_seen_s = max(keep.last_seen_s, drop.last_seen_s)
+                        self.profiles.remove(drop)
+                        merges.append((drop.profile_id, keep.profile_id))
+                        changed = True
+                        break
+                if changed:
+                    break
+        return merges
+
     # -- views -------------------------------------------------------------
 
     def enrolled_profiles(self) -> List[Profile]:

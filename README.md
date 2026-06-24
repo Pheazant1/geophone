@@ -114,6 +114,9 @@ speed, and three independent time differences fix the position inside the array.
 | `profile_classifier.py` | Extracts features, classifies the source, range-corrects mass, matches against saved profiles, picks the covering camera and emits the JSON alert webhook. |
 | `pattern_memory.py`     | The self-learning core: an unsupervised pattern memory that clusters recurring feature vectors into profiles, confirms the ones that repeat, and flags anything novel. Carries no labels and no built-in idea of what a human or vehicle is. |
 | `v1_demo.py`            | Wires the physics stack into `pattern_memory.py` and runs the label-free learning demonstration: a site is learned from scratch, then guarded, recognising its regulars and alerting on unseen signatures. |
+| `stage1_simulation.py`  | A blind rediscovery trial: a fixed, secret cast of characters follows a weekly routine across a simulated fortnight, and the system is scored on whether it independently rebuilds one profile per real character. |
+| `environment.py`        | Ground and weather presets (dry, wet, mud, snow, frozen, rain) for the sandbox, each value tagged as physically grounded or as an estimate a real site would calibrate. |
+| `sim_game.py`           | An interactive pygame sandbox: place and tune characters, pick the weather, fast-forward time, and watch the real pattern memory build its database live. |
 
 ## Quickstart
 
@@ -197,6 +200,62 @@ There is no neural network and no labelled data anywhere in this mode: the
 learning is interpretable statistical pattern memory, which is what lets it run
 on the same low-cost edge hardware and have every match be explainable.
 
+### Blind rediscovery trial
+
+`stage1_simulation.py` is a controlled test of the self-learning core. A fixed,
+secret cast of characters, three people of different builds and gaits, a car and
+a dog, follows a weekly routine across a simulated fortnight. Each crossing is
+synthesised and fed to the pattern memory, which never sees the cast or the
+schedule. At the end the system's learned profiles are scored against the secret
+cast, and a clean pass is one profile per real character with no merges or
+splits.
+
+```bash
+python stage1_simulation.py
+python stage1_simulation.py --days 14 --seed 1 --quiet
+```
+
+The run prints the secret schedule, an accelerated clock of every detected
+crossing and what the memory did with it, and a scorecard with the verdict. A
+maintenance step consolidates any profile a single source split into, which is
+safe because two genuinely different sources are always farther apart than the
+match threshold. This is the clean, scheduled case on purpose; environmental
+drift, irregular visitors and simultaneous crossings are deliberately left to a
+later stage.
+
+### Interactive sandbox
+
+`sim_game.py` is a top-down 2D sandbox (built on pygame) for exploring the
+self-learning core by hand. You add characters (people, animals, vehicles), tune
+their weight, gait, footfall frequency and spontaneity, choose the ground and
+weather, and fast-forward time. Every crossing is synthesised and run through
+the real pipeline and the real pattern memory, and a live panel shows the
+database the system is building blind, with each learned profile checked against
+the character that produced it.
+
+```bash
+pip install pygame      # one-time, only needed for the sandbox
+python sim_game.py
+```
+
+People, animals and vehicles are drawn as small figures, and the ground is
+recoloured to match the weather (grass, mud, snow, frozen, with falling rain or
+snow). Characters can be marked as residents, who move frequently all day and
+sleep at night, so the system naturally learns them best. It opens in a resizable
+window (drag or snap it to half screen as you like); press F for full screen,
+space to pause, plus and minus to change speed, and Escape to end.
+
+Ending the run (Escape, or the End button) shows a session report: the database
+of regulars the system learned, the activity it flagged as novel or one-off, and
+the run statistics. Sessions can be saved to disk and reopened later from the
+Past sessions browser, so earlier runs can be reviewed.
+
+The brain in the loop is the genuine one, so behaviour and tuning observed here
+transfer to a real deployment; the learned memory itself does not, which is
+correct, since the system relearns each real site. The environment numbers are
+physically reasonable rather than measured, and the panel reports how many of
+the active condition's values are estimates rather than grounded figures.
+
 ## Example alert
 
 ```json
@@ -272,6 +331,9 @@ geophone/
   profile_classifier.py  features, classification, profiles, JSON alerts
   pattern_memory.py      unsupervised self-learning pattern memory
   v1_demo.py             label-free learning and guarding demonstration
+  stage1_simulation.py   blind rediscovery trial over a simulated fortnight
+  environment.py         ground and weather presets for the sandbox
+  sim_game.py            interactive pygame learning sandbox
   requirements.txt       numpy, scipy
   README.md              this document
 ```

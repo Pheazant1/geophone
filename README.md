@@ -240,15 +240,38 @@ python sim_game.py
 
 People, animals and vehicles are drawn as small figures, and the ground is
 recoloured to match the weather (grass, mud, snow, frozen, with falling rain or
-snow). Characters can be marked as residents, who move frequently all day and
-sleep at night, so the system naturally learns them best. It opens in a resizable
-window (drag or snap it to half screen as you like); press F for full screen,
-space to pause, plus and minus to change speed, and Escape to end.
+snow). Clicking a character opens an editor screen: biometrics, a clickable
+24-hour movement schedule (leave gaps for breaks, or use the home, office and
+night-shift presets), an away or on-holiday toggle for testing whether a source
+is re-identified after a long absence, an intruder tag, and a button to make it
+cross immediately. It opens in a resizable window (drag or snap it to half screen
+as you like); press F for full screen, space to pause, plus and minus to change
+speed, and Escape to end.
+
+A map editor lets you paint surface zones onto the site (pavement, concrete,
+gravel, building floor). Harder surfaces ring higher and couple more strongly,
+so a footstep reads differently on pavement than on soil, and that change shows
+up in the feed. A surface map is site knowledge, the same category as the sensor
+positions and wave speed the system already uses, so an "AI surface-aware"
+toggle decides whether the system corrects for surfaces (recognising a person
+across surfaces, as a calibrated site would) or stays surface-blind (a harder
+test, where the same person can look different on different ground). Target
+knowledge, who is crossing and when, is never shared either way.
 
 Ending the run (Escape, or the End button) shows a session report: the database
-of regulars the system learned, the activity it flagged as novel or one-off, and
-the run statistics. Sessions can be saved to disk and reopened later from the
-Past sessions browser, so earlier runs can be reviewed.
+of regulars the system learned, the activity it flagged as novel or one-off, the
+run statistics, detection metrics (intrusion precision, recall and F1, profile
+purity, and counts of splits and collisions), and an overlay comparing what you
+set up (characters and the intrusions you triggered) against what the AI did
+(profiles built, intrusions caught, false alarms). An accuracy-chart screen
+plots, per character, the real crossings against the crossings the AI actually
+recognised as that profile over time, so a divergence shows exactly where and
+when the AI lost an identity. The full per-crossing event record can be exported
+to CSV for offline analysis, which is also the logging format a real deployment
+would produce. Sessions can be saved to disk and reopened later from the
+Past sessions browser. Throughout, the learning core is never told the scenario;
+it only ever receives the seismic feed (plus, optionally, the fixed site map as
+calibration).
 
 The brain in the loop is the genuine one, so behaviour and tuning observed here
 transfer to a real deployment; the learned memory itself does not, which is

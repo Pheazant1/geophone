@@ -252,7 +252,7 @@ class GeophoneArraySimulator:
                            num_steps: int = 8, cadence_hz: float = 1.8,
                            mass_kg: float = 75.0, decay_tau_s: float = 0.06,
                            freq_hz: float = 30.0, timing_jitter: float = 0.03,
-                           asymmetry: float = 0.05,
+                           asymmetry: float = 0.05, surface_fn=None,
                            label: str = "footsteps") -> np.ndarray:
         """Inject a walking human moving along a straight path.
 
@@ -271,9 +271,10 @@ class GeophoneArraySimulator:
         for i in range(num_steps):
             frac = i / max(num_steps - 1, 1)
             position = path_start + (path_end - path_start) * frac
+            f_mult, a_mult = surface_fn(position) if surface_fn else (1.0, 1.0)
             foot_gain = 1.0 + (asymmetry if i % 2 else -asymmetry)
-            amp = reference_amp * foot_gain * (1.0 + self.rng.normal(0.0, 0.02))
-            freq = freq_hz * (1.0 + self.rng.normal(0.0, 0.03))
+            amp = reference_amp * foot_gain * a_mult * (1.0 + self.rng.normal(0.0, 0.02))
+            freq = freq_hz * f_mult * (1.0 + self.rng.normal(0.0, 0.03))
             self._emit(feed, position, cursor, amp, freq, decay_tau_s, 0.005)
             cursor += step_interval + self.rng.normal(0.0, timing_jitter * step_interval)
 
@@ -296,7 +297,7 @@ class GeophoneArraySimulator:
                          axle_decay_tau_s: float = 0.16,
                          rumble_fundamental_hz: float = 9.0,
                          rumble_harmonics: Sequence[int] = (1, 2, 3),
-                         rumble_amp_v: float = 0.006,
+                         rumble_amp_v: float = 0.006, surface_fn=None,
                          label: str = "vehicle") -> np.ndarray:
         """Inject a vehicle driving along a path past the array.
 
@@ -315,8 +316,9 @@ class GeophoneArraySimulator:
         for j, mass in enumerate(axle_masses):
             frac = j / max(n_axles - 1, 1)
             position = path_start + (path_end - path_start) * frac
-            amp = AXLE_COUPLING_V_PER_KG * mass * (1.0 + self.rng.normal(0.0, 0.02))
-            freq = axle_freq_hz * (1.0 + self.rng.normal(0.0, 0.03))
+            f_mult, a_mult = surface_fn(position) if surface_fn else (1.0, 1.0)
+            amp = AXLE_COUPLING_V_PER_KG * mass * a_mult * (1.0 + self.rng.normal(0.0, 0.02))
+            freq = axle_freq_hz * f_mult * (1.0 + self.rng.normal(0.0, 0.03))
             self._emit(feed, position, cursor, amp, freq, axle_decay_tau_s, 0.01)
             axle_times.append(cursor)
             cursor += axle_spacing_s

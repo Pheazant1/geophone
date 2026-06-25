@@ -561,6 +561,12 @@ class Game:
         self.characters.append(ch)
         self.select(ch)
 
+    def _activate(self, ch: Character):
+        """Release a character into the scene if it is not already participating."""
+        if not ch.active:
+            ch.active = True
+            ch.schedule_first(self.clock_s, self.rng)
+
     def _force_cross(self, ch: Character):
         """Make a character enter the scene immediately (e.g. a burglar now)."""
         detected, ps, pe = self._synthesize_and_learn(ch)
@@ -1090,6 +1096,13 @@ class Game:
         mp = self._mouse_canvas()
         self.screen.blit(self.big.render(
             "EDIT: {0}  ({1})".format(ch.name, ch.kind), True, ch.color), (40, 24))
+        if ch.active:
+            self.screen.blit(self.font.render(
+                "In the scene: producing crossings.", True, GOOD), (40, 56))
+        else:
+            self.screen.blit(self.font.render(
+                "NOT in the scene yet. Pick a schedule on the right (or 'In scene' / "
+                "'Make cross now') to make it appear.", True, WARN), (40, 56))
 
         # left: biometrics
         self.screen.blit(self.font.render("Biometrics", True, DIM), (40, 110))
@@ -1566,17 +1579,22 @@ class Game:
             p = event.pos
             if self.btn_e_type.hit(p):
                 ch.mover = not ch.mover
-                if ch.mover and not any(ch.schedule):
-                    ch.schedule = SCHEDULE_PRESETS["home"][:]
-                ch.next_cross_s = self.clock_s + 1.0
+                if ch.mover:
+                    if not any(ch.schedule):
+                        ch.schedule = SCHEDULE_PRESETS["home"][:]
+                    self._activate(ch)
             elif self.btn_e_home.hit(p):
                 ch.mover = True; ch.schedule = SCHEDULE_PRESETS["home"][:]
+                self._activate(ch)
             elif self.btn_e_office.hit(p):
                 ch.mover = True; ch.schedule = SCHEDULE_PRESETS["office"][:]
+                self._activate(ch)
             elif self.btn_e_night.hit(p):
                 ch.mover = True; ch.schedule = SCHEDULE_PRESETS["night"][:]
+                self._activate(ch)
             elif self.btn_e_all.hit(p):
                 ch.mover = True; ch.schedule = SCHEDULE_PRESETS["all"][:]
+                self._activate(ch)
             elif self.btn_e_clear.hit(p):
                 ch.schedule = [False] * 24
             elif self.btn_e_away.hit(p):
@@ -1601,6 +1619,7 @@ class Game:
                 h = int((p[0] - self.sched_bar.x) / (self.sched_bar.width // 24))
                 if 0 <= h < 24:
                     ch.schedule[h] = not ch.schedule[h]
+                    self._activate(ch)
         return True
 
     def _handle_sim(self, event):

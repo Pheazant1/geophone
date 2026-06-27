@@ -135,8 +135,11 @@ SURFACE_TYPES = {
     "concrete": {"label": "Concrete slab", "freq": 1.45, "amp": 1.8, "color": (150, 152, 160)},
     "gravel": {"label": "Gravel", "freq": 1.12, "amp": 0.8, "color": (120, 108, 88)},
     "building": {"label": "Building floor", "freq": 1.55, "amp": 1.9, "color": (96, 84, 72)},
+    # an ignore zone is a mask, not a surface: activity localised inside it is
+    # dropped (e.g. the house interior, when you only want to watch the grounds).
+    "ignore": {"label": "Ignore zone", "freq": 1.0, "amp": 1.0, "color": (70, 40, 44)},
 }
-SURFACE_BRUSHES = ["pavement", "concrete", "gravel", "building"]
+SURFACE_BRUSHES = ["pavement", "concrete", "gravel", "building", "ignore"]
 
 
 @dataclass
@@ -206,12 +209,17 @@ class Character:
     spontaneity: float = 0.0        # chance of breaking into a run, per crossing
     axle_freq_hz: float = 14.0
     axle_spacing_s: float = 0.45
+    # individual gait fingerprint: even two same-size/same-pace people differ here
+    asymmetry: float = 0.05         # left/right footfall imbalance
+    timing_var: float = 0.03        # step-to-step timing variability
+    decay_tau: float = 0.06         # footfall decay (spectral shape)
     mover: bool = False             # follows a daily schedule, vs occasional visitor
     schedule: List[bool] = field(default_factory=lambda: make_schedule((7, 23)))
     away: bool = False              # temporarily absent (on holiday): no crossings
     is_intruder: bool = False       # ground truth: counts as an intrusion you set up
     active: bool = False            # released into the scene (produces crossings)
     numbered: bool = False          # named, after it first left an impact
+    leave_at: Optional[float] = None  # sim time to auto-deactivate (timed injection)
     next_cross_s: float = 0.0
 
     def _gap(self, rng: random.Random) -> float:
@@ -281,8 +289,9 @@ def extract_signature(result, window, env: Environment,
     e = min(result.envelope.shape[1], window.end_idx + pad)
     cadence = _cadence_hz(result.envelope[window.best_channel][s:e], FS)
 
-    return np.array([log_ref_amp, dominant_freq,
-                     features.low_freq_ratio, cadence], dtype=float)
+    vector = np.array([log_ref_amp, dominant_freq,
+                       features.low_freq_ratio, cadence], dtype=float)
+    return vector, track.position.x_m, track.position.y_m
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +360,12 @@ class Slider:
 SPEEDS = [0, 1, 10, 60, 300, 1800]
 SPEED_LABELS = ["paused", "1x", "10x", "60x", "300x", "1800x"]
 
+# Playback speeds for the movement-replay screen (sim-seconds per real second).
+REPLAY_SPEEDS = [60, 300, 1800, 7200]
+REPLAY_SPEED_LABELS = ["60x", "300x", "1800x", "7200x"]
+REPLAY_WINDOWS = [(None, "all time"), (86400.0, "last 24h"),
+                  (7 * 86400.0, "last 7 days")]
+
 # Hours a resident is awake and moving; outside this they are asleep (no events).
 WAKE_START_H = 7
 WAKE_END_H = 23
@@ -399,6 +414,8 @@ class Game:
 
         self.surfaces: List[Surface] = []
         self.ai_surface_aware = True
+        self.verify_mode = False           # known-resident verification vs blind
+        self.locked = []                   # enrolled resident signatures (means)
         self.map_brush = "pavement"
         self.selected_surface: Optional[Surface] = None
         self._drag_start: Optional[Tuple[int, int]] = None
@@ -412,8 +429,17 @@ class Game:
         self._last_running = False
         self.start_ticks = pygame.time.get_ticks()
 
-        self.mode = "sim"               # sim | report | history | viewer | edit | map | charts
+        self.mode = "sim"               # sim|report|history|viewer|edit|map|charts|intruders|replay
         self.chart_idx = 0
+        self._img_saved = ""            # last saved chart/map image, for feedback
+        # movement replay state
+        self.replay_time = 0.0
+        self.replay_playing = False
+        self.replay_speed_idx = 1
+        self.replay_who_idx = 0
+        self.replay_window_idx = 0
+        self._replay_start = 0.0
+        self._replay_end = 0.0
         self.flagged: List[dict] = []   # novel signatures seen after warm-up
         self.history: List[Tuple[str, dict]] = []
         self.viewer_report: Optional[dict] = None
@@ -459,6 +485,7 @@ class Game:
         self.true_intrusions = 0        # crossings by characters you tagged intruder
         self.intrusions_caught = 0      # of those, how many the AI flagged as novel
         self.events: List[dict] = []    # full per-crossing record (for log/metrics/charts)
+        self.pings: List[tuple] = []    # recent flagged detections, for live map pings
 
     def _build_buttons(self):
         x = PANEL_X
@@ -489,7 +516,9 @@ class Game:
         # accuracy charts screen
         self.btn_c_prev = Button(40, by, 50, 32, "<")
         self.btn_c_next = Button(98, by, 50, 32, ">")
-        self.btn_c_back = Button(158, by, 150, 32, "Back")
+        self.btn_c_back = Button(158, by, 120, 32, "Back")
+        self.btn_c_save = Button(290, by, 170, 32, "Save image")
+        self.btn_i_save = Button(200, by, 170, 32, "Save image")
 
         # character editor screen
         ex = 620
@@ -500,16 +529,32 @@ class Game:
         self.btn_e_night = Button(ex + 168, 246, 78, 24, "Night")
         self.btn_e_all = Button(ex + 252, 246, 58, 24, "All")
         self.btn_e_clear = Button(ex + 316, 246, 72, 24, "Clear")
-        self.btn_e_away = Button(ex, 296, 320, 28, "Away (holiday): off")
+        self.btn_e_away = Button(ex, 296, 320, 28, "Off-site (absent): off")
         self.btn_e_intruder = Button(ex, 334, 340, 28, "Tag as intruder: off")
-        self.btn_e_cross = Button(ex, 380, 240, 28, "Make cross now")
+        self.btn_e_cross = Button(ex, 380, 240, 28, "Make one crossing now")
         self.btn_e_active = Button(ex, 416, 360, 28, "In scene: off")
+        self.btn_e_inject = Button(ex, 452, 360, 28, "Inject as intruder (stays 1 hr)")
         self.btn_e_done = Button(40, by, 150, 32, "Done")
         self.btn_e_remove = Button(200, by, 150, 32, "Remove character")
 
         # sim-screen: map and surface-awareness
         self.btn_map = Button(x, 380, 220, 28, "Edit map / surfaces")
         self.btn_surf_aware = Button(x, 416, 280, 28, "AI surface-aware: ON")
+        self.btn_intruders = Button(x, 452, 220, 28, "Intruder map")
+        self.btn_replay = Button(x, 488, 220, 28, "Movement replay")
+        self.btn_lock = Button(x, 524, 290, 28, "Lock residents (verify mode)")
+        self.btn_i_back = Button(40, WIN_H - 52, 150, 32, "Back")
+
+        # movement replay screen
+        ry = 96
+        self.btn_rp_who = Button(600, ry, 330, 28, "Who: everyone")
+        self.btn_rp_window = Button(600, ry + 38, 330, 28, "Window: all time")
+        self.rp_speed_buttons = [
+            Button(600 + i * 80, ry + 92, 74, 26, lab)
+            for i, lab in enumerate(REPLAY_SPEED_LABELS)]
+        self.rp_scrub = pygame.Rect(20, 606, 900, 18)
+        self.btn_rp_play = Button(20, 636, 130, 32, "Play")
+        self.btn_rp_back = Button(WIN_W - 170, 636, 130, 32, "Back")
 
         # map editor screen
         mx = 620
@@ -522,16 +567,8 @@ class Game:
         self.btn_m_done = Button(40, by, 150, 32, "Done")
 
     def _seed_default_cast(self):
-        self.add_character("human", name="Person-1", active=True, mass=80,
-                           cadence=1.6, step_freq=30, start=(8, 10), end=(14, 16))
-        self.add_character("human", name="Person-2", active=True, mass=78,
-                           cadence=2.2, step_freq=32, start=(22, 9), end=(17, 15))
-        self.add_character("animal", name="Animal-1", active=True, mass=45,
-                           cadence=3.0, step_freq=40, start=(11, 11), end=(18, 15))
-        self.kind_counts = {"human": 2, "animal": 1, "vehicle": 0}
-        self.characters[0].mover = True           # one resident by default
-        self.characters[0].schedule = SCHEDULE_PRESETS["home"][:]
-        self.select(self.characters[0])
+        # Start empty: nothing is in the scene until you add and configure it.
+        pass
 
     # -- character management ----------------------------------------------
 
@@ -556,6 +593,10 @@ class Game:
             step_freq_hz=step_freq if step_freq is not None else defaults["step_freq"])
         ch.numbered = name is not None
         ch.active = active
+        # give every character an individual gait fingerprint
+        ch.asymmetry = self.rng.uniform(0.02, 0.13)
+        ch.timing_var = self.rng.uniform(0.02, 0.08)
+        ch.decay_tau = self.rng.uniform(0.05, 0.085)
         if active:
             ch.schedule_first(self.clock_s, self.rng)
         self.characters.append(ch)
@@ -566,6 +607,18 @@ class Game:
         if not ch.active:
             ch.active = True
             ch.schedule_first(self.clock_s, self.rng)
+
+    def _inject_intruder(self, ch: Character):
+        """Drop a character in as an intruder right now; it stays about an hour."""
+        ch.is_intruder = True
+        ch.mover = True
+        ch.schedule = SCHEDULE_PRESETS["all"][:]
+        ch.active = True
+        ch.leave_at = self.clock_s + 3600.0
+        ch.next_cross_s = self.clock_s + self.rng.uniform(60.0, 180.0)
+        self._force_cross(ch)                  # one crossing immediately
+        self._log("{0}  {1} injected as intruder (stays ~1 hour)".format(
+            self._timestr(), ch.name), BAD)
 
     def _force_cross(self, ch: Character):
         """Make a character enter the scene immediately (e.g. a burglar now)."""
@@ -662,6 +715,8 @@ class Game:
                 cadence_hz=float(ch.cadence_hz * (1.6 if running else 1.0)),
                 mass_kg=float(ch.mass_kg * gain),
                 freq_hz=float(ch.step_freq_hz * (1.1 if running else 1.0)),
+                decay_tau_s=ch.decay_tau, asymmetry=ch.asymmetry,
+                timing_jitter=ch.timing_var,
                 surface_fn=surface_fn, label=ch.name)
         else:
             half = ch.mass_kg * self.env.coupling_gain
@@ -679,19 +734,27 @@ class Game:
 
         window = max(result.windows, key=lambda w: w.peak_v)
         correct = self._surface_factor if (self.ai_surface_aware and self.surfaces) else None
-        vector = extract_signature(result, window, self.env, surface_fn=correct)
+        vector, ex, ey = extract_signature(result, window, self.env, surface_fn=correct)
+        if self._in_ignore_zone(ex, ey):
+            self._log("{0}  {1} -> ignored (masked zone)".format(
+                self._timestr(), ch.name), DIM)
+            return True, ps, pe          # inside an ignore zone: not processed
         obs = self.memory.observe(vector, self.clock_s)
         self.profile_truth.setdefault(obs.profile_id, Counter())[ch.name] += 1
-        mid = ((float(ps[0]) + float(pe[0])) / 2, (float(ps[1]) + float(pe[1])) / 2)
-        surf = self._surface_at(*mid)
-        self.events.append({
+        surf = self._surface_at(ex, ey)
+        ev = {
             "t": round(self.clock_s, 1), "true": ch.name, "kind": ch.kind,
             "intruder": ch.is_intruder,
             "surface": surf.kind if surf else "soil", "weather": self.env.key,
             "decision": "new" if obs.is_new else "match",
             "profile": obs.profile_id,
             "distance": round(obs.distance, 3) if np.isfinite(obs.distance) else None,
-        })
+            "x": round(ex, 2), "y": round(ey, 2),
+            "path": [round(float(ps[0]), 1), round(float(ps[1]), 1),
+                     round(float(pe[0]), 1), round(float(pe[1]), 1)],
+            "flagged": False,
+        }
+        self.events.append(ev)
         if len(self.events) > 20000:
             self.events = self.events[-20000:]
 
@@ -704,19 +767,31 @@ class Game:
         run_tag = " [RUN]" if running else ""
         if ch.is_intruder:
             self.true_intrusions += 1
-        # Flag only signatures that are clearly unlike anything already known,
-        # once the regulars are established, so a regular's momentarily odd
-        # reading is not mistaken for an intruder.
-        warm = (len(self.memory.enrolled_profiles()) >= 2 and self.clock_s > 3600
-                and obs.distance > 1.6)
-        if obs.is_new and warm:
+        # Decide whether this crossing is "unknown" (intruder). In verify mode
+        # it is anything that matches no locked resident signature; otherwise it
+        # is the blind novelty heuristic (clearly unlike the known regulars).
+        if self.verify_mode and self.locked:
+            dmin = min(self.memory._distance(vector, m) for m in self.locked)
+            flag = dmin > self.memory.match_distance
+            flag_reason = "no resident match (d={0:.2f})".format(dmin)
+        else:
+            warm = (len(self.memory.enrolled_profiles()) >= 2
+                    and self.clock_s > 3600 and obs.distance > 1.6)
+            flag = obs.is_new and warm
+            flag_reason = "novel signature"
+        if flag:
+            ev["flagged"] = True
             self.flagged.append({"time": self._timestr(), "identity": ch.name,
                                  "distance": round(obs.distance, 2),
                                  "intruder": ch.is_intruder})
+            self.pings.append((ex, ey, pygame.time.get_ticks(), ch.is_intruder))
+            if len(self.pings) > 80:
+                self.pings = self.pings[-80:]
             if ch.is_intruder:
                 self.intrusions_caught += 1
-            self._log("{0}  {1}{2} -> NEW {3}  *** flagged: novel ***".format(
-                self._timestr(), ch.name, run_tag, obs.profile_id), BAD)
+            self._log("{0}  {1}{2} -> *** INTRUDER: {3} at ({4:.0f},{5:.0f}) "
+                      "***".format(self._timestr(), ch.name, run_tag,
+                                   flag_reason, ex, ey), BAD)
         elif obs.is_new:
             self._log("{0}  {1}{2} -> NEW {3}".format(
                 self._timestr(), ch.name, run_tag, obs.profile_id), ACCENT)
@@ -731,13 +806,25 @@ class Game:
     # -- update loop -------------------------------------------------------
 
     def update(self, dt_real: float):
+        if self.mode == "replay":
+            if self.replay_playing and self.events:
+                self.replay_time += dt_real * REPLAY_SPEEDS[self.replay_speed_idx]
+                if self.replay_time >= self._replay_end:
+                    self.replay_time = self._replay_end
+                    self.replay_playing = False
+            return
         speed = SPEEDS[self.speed_idx]
         self.clock_s += dt_real * speed
         if speed == 0:
             return
         for ch in self.characters:
+            if ch.leave_at is not None and self.clock_s >= ch.leave_at:
+                ch.active = False           # timed injection window has ended
+                ch.leave_at = None
+                self._log("{0}  {1} has left the area".format(
+                    self._timestr(), ch.name), DIM)
             if not ch.active or ch.away:
-                continue          # not released into the scene, or on holiday
+                continue          # not released into the scene, or off-site
             fired = 0
             while self.clock_s >= ch.next_cross_s and fired < 3:
                 if ch.mover and not self._char_active(ch):
@@ -750,6 +837,7 @@ class Game:
                     (float(ps[0]), float(ps[1])), (float(pe[0]), float(pe[1]))))
                 ch.reschedule(self.rng)
                 fired += 1
+        self.memory.prune(self.clock_s, 2 * 86400)   # retire stale one-off noise
         now = pygame.time.get_ticks()
         self.crossings = [c for c in self.crossings
                           if now - c.born_ms < c.duration_ms]
@@ -793,6 +881,17 @@ class Game:
             return (1.0, 1.0)
         t = SURFACE_TYPES[surf.kind]
         return (t["freq"], t["amp"])
+
+    def _in_ignore_zone(self, x, y) -> bool:
+        return any(s.kind == "ignore" and s.contains(x, y) for s in self.surfaces)
+
+    def _lock_residents(self):
+        """Snapshot the enrolled signatures as the known-resident allow-list."""
+        self.locked = [np.array(p.mean) for p in self.memory.enrolled_profiles()]
+        self.verify_mode = bool(self.locked)
+        self._log("locked {0} resident signature(s); verification ON".format(
+            len(self.locked)) if self.locked
+            else "no enrolled residents yet to lock", GOLD)
 
     def _px_to_m(self, px, py) -> Tuple[float, float]:
         return ((px - MAP_RECT.x) / SCALE, SITE_M - (py - MAP_RECT.y) / SCALE)
@@ -882,26 +981,99 @@ class Game:
         self._log("saved to sessions/" + name, GOOD)
         return name
 
+    def _save_canvas_image(self, prefix: str) -> str:
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        safe = "".join(c if c.isalnum() else "_" for c in prefix)
+        name = "{0}_{1}.png".format(
+            safe, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        pygame.image.save(self.canvas, os.path.join(SESSIONS_DIR, name))
+        self._img_saved = "saved sessions/" + name
+        return name
+
     def export_log(self) -> str:
         os.makedirs(SESSIONS_DIR, exist_ok=True)
         name = "eventlog_{0}.csv".format(
             datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-        cols = ["t", "true", "kind", "intruder", "surface", "weather",
-                "decision", "profile", "distance"]
+        cols = ["t", "stamp", "true", "kind", "intruder", "surface", "weather",
+                "decision", "profile", "distance", "x", "y", "flagged"]
         with open(os.path.join(SESSIONS_DIR, name), "w", encoding="utf-8",
                   newline="") as f:
-            w = csv.DictWriter(f, fieldnames=cols)
+            w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
             w.writeheader()
             for e in self.events:
-                w.writerow(e)
+                row = dict(e)
+                row["stamp"] = self._fmt_time(e["t"])   # readable D05 17:09
+                w.writerow(row)
         self._log("exported {0} events to sessions/{1}".format(
             len(self.events), name), GOOD)
         return name
+
+    def _chart_series(self, name):
+        """Return (dominant_profile, [(t, real_cumulative, recognised_cumulative)])."""
+        dom, dn = None, 0
+        for pid, c in self.profile_truth.items():
+            if c.get(name, 0) > dn:
+                dom, dn = pid, c[name]
+        ev = sorted([e for e in self.events if e["true"] == name],
+                    key=lambda e: e["t"])
+        series, tc, ac = [], 0, 0
+        for e in ev:
+            tc += 1
+            if e["profile"] == dom:
+                ac += 1
+            series.append((e["t"], tc, ac))
+        return dom, series
+
+    def _save_chart_data(self, name) -> str:
+        """Write the full point-by-point chart series to CSV, replottable anywhere."""
+        _, series = self._chart_series(name)
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        safe = "".join(c if c.isalnum() else "_" for c in name)
+        fn = "chartdata_{0}_{1}.csv".format(
+            safe, datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        with open(os.path.join(SESSIONS_DIR, fn), "w", encoding="utf-8",
+                  newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["t_seconds", "stamp", "real_crossings", "recognised", "gap"])
+            for t, tc, ac in series:
+                w.writerow([round(t, 1), self._fmt_time(t), tc, ac, tc - ac])
+        return fn
 
     def _autosave(self):
         if not self._saved_on_exit and any(p.count for p in self.memory.profiles):
             self.save_session()
             self._saved_on_exit = True
+
+    def _who_options(self):
+        names = sorted({e["true"] for e in self.events})
+        return ["everyone"] + names + ["intruders only"]
+
+    def _who_value(self):
+        opts = self._who_options()
+        return opts[self.replay_who_idx % len(opts)]
+
+    def _replay_window_start(self):
+        if not self.events:
+            return 0.0
+        mn = min(e["t"] for e in self.events)
+        span = REPLAY_WINDOWS[self.replay_window_idx][0]
+        return mn if span is None else max(mn, self._replay_end - span)
+
+    def _enter_replay(self):
+        if self.events:
+            self._replay_end = max(e["t"] for e in self.events)
+            self._replay_start = self._replay_window_start()
+            self.replay_time = self._replay_start
+        self.replay_playing = False
+        self.mode = "replay"
+
+    def _kind_glyph(self, kind, color, p):
+        if kind == "vehicle":
+            draw_vehicle(self.screen, p[0], p[1], color)
+        elif kind == "animal":
+            draw_animal(self.screen, p[0], p[1], color)
+        else:
+            draw_human(self.screen, p[0], p[1], color, False)
 
     def _enter_history(self):
         self.history = []
@@ -936,6 +1108,12 @@ class Game:
         if self.mode == "charts":
             self._draw_charts()
             return
+        if self.mode == "intruders":
+            self._draw_intruder_map()
+            return
+        if self.mode == "replay":
+            self._draw_replay()
+            return
         self.screen.fill(BG)
         self._draw_header()
         self._draw_map()
@@ -949,101 +1127,314 @@ class Game:
                 return ch.color
         return INK
 
+    def _fmt_time(self, t):
+        """Format a sim time in seconds as 'D05 17:09'."""
+        day = int(t // 86400) + 1
+        tod = int(t % 86400)
+        return "D{0:02d} {1:02d}:{2:02d}".format(day, tod // 3600, (tod % 3600) // 60)
+
+    def _draw_intruder_map(self):
+        self.screen.fill(BG)
+        mp = self._mouse_canvas()
+        self.screen.blit(self.big.render(
+            "INTRUDER MAP", True, INK), (MAP_RECT.x, 22))
+        flagged = [e for e in self.events if e.get("flagged")]
+        n_recent = min(16, len(flagged))
+        start = len(flagged) - n_recent      # the recent ones get numbered
+
+        ground, grid = ENV_VISUALS.get(self.env.key, ((36, 72, 44), (52, 92, 60)))
+        pygame.draw.rect(self.screen, ground, MAP_RECT, border_radius=6)
+        prev = self.screen.get_clip()
+        self.screen.set_clip(MAP_RECT)
+        for g in range(0, 31, 5):
+            pygame.draw.line(self.screen, grid, m_to_px(g, 0), m_to_px(g, 30), 1)
+            pygame.draw.line(self.screen, grid, m_to_px(0, g), m_to_px(30, g), 1)
+        self._draw_surfaces()
+        # each flagged detection: its path, a ping where it was caught, and (for
+        # the recent ones) a number tying it to the timestamped list on the right
+        for i, e in enumerate(flagged):
+            col = BAD if e.get("intruder") else WARN
+            a, b, c, d = e.get("path", [0, 0, 0, 0])
+            faint = tuple(int(v * 0.5) for v in col)
+            pygame.draw.line(self.screen, faint, m_to_px(a, b), m_to_px(c, d), 1)
+            gp = m_to_px(e.get("x", 0), e.get("y", 0))
+            pygame.draw.circle(self.screen, col, gp, 5)
+            pygame.draw.circle(self.screen, col, gp, 11, 1)
+            if i >= start:
+                self.screen.blit(self.small.render(str(i - start + 1), True, INK),
+                                 (gp[0] + 9, gp[1] - 16))
+        self.screen.set_clip(prev)
+        for i, (sx, sy) in enumerate(SENSOR_POSITIONS_M):
+            p = m_to_px(sx, sy)
+            pygame.draw.rect(self.screen, ACCENT,
+                             pygame.Rect(p[0] - 6, p[1] - 6, 12, 12), border_radius=2)
+
+        # legend + timestamped list on the right
+        rx = 620
+        true_caught = sum(1 for e in flagged if e.get("intruder"))
+        self.screen.blit(self.small.render(
+            "Dot = where localised. Line = path. Number = list below.", True, DIM),
+            (rx, 64))
+        pygame.draw.circle(self.screen, BAD, (rx + 8, 92), 5)
+        self.screen.blit(self.small.render(
+            "intruder you tagged ({0})".format(true_caught), True, INK),
+            (rx + 22, 85))
+        pygame.draw.circle(self.screen, WARN, (rx + 8, 114), 5)
+        self.screen.blit(self.small.render(
+            "false alarm ({0})".format(len(flagged) - true_caught), True, INK),
+            (rx + 22, 107))
+
+        self.screen.blit(self.font.render(
+            "When and where flagged (most recent {0} of {1}):".format(
+                n_recent, len(flagged)), True, GOOD), (rx, 144))
+        yy = 170
+        for i, e in enumerate(flagged[start:], 1):
+            col = BAD if e.get("intruder") else WARN
+            self.screen.blit(self.small.render(
+                "{0:>2}.  {1}   {2}   at ({3:.0f}, {4:.0f})".format(
+                    i, self._fmt_time(e["t"]), e["true"], e["x"], e["y"]),
+                True, col), (rx, yy))
+            yy += 19
+        if not flagged:
+            self.screen.blit(self.font.render(
+                "Nothing flagged yet. Run the sim with an intruder, or tag a "
+                "character as an intruder in its editor.", True, DIM),
+                (MAP_RECT.x, MAP_RECT.bottom + 12))
+
+        self.btn_i_back.draw(self.screen, self.font, self.btn_i_back.hit(mp))
+        self.btn_i_save.draw(self.screen, self.font, self.btn_i_save.hit(mp))
+        if self._img_saved:
+            self.screen.blit(self.small.render(self._img_saved, True, GOOD),
+                             (self.btn_i_save.rect.right + 14, self.btn_i_save.rect.y + 8))
+
+    def _draw_replay(self):
+        self.screen.fill(BG)
+        mp = self._mouse_canvas()
+        who = self._who_value()
+
+        def match(e):
+            if who == "everyone":
+                return True
+            if who == "intruders only":
+                return bool(e.get("intruder"))
+            return e["true"] == who
+
+        self.screen.blit(self.big.render("MOVEMENT REPLAY", True, INK),
+                         (MAP_RECT.x, 22))
+        ground, grid = ENV_VISUALS.get(self.env.key, ((36, 72, 44), (52, 92, 60)))
+        pygame.draw.rect(self.screen, ground, MAP_RECT, border_radius=6)
+        prev = self.screen.get_clip()
+        self.screen.set_clip(MAP_RECT)
+        for g in range(0, 31, 5):
+            pygame.draw.line(self.screen, grid, m_to_px(g, 0), m_to_px(g, 30), 1)
+            pygame.draw.line(self.screen, grid, m_to_px(0, g), m_to_px(30, g), 1)
+        self._draw_surfaces()
+
+        # fading trail of where they went, up to the current playback time
+        trail = [e for e in self.events
+                 if match(e) and self._replay_start <= e["t"] <= self.replay_time]
+        for e in trail[-1500:]:
+            col = tuple(int(v * 0.35) for v in self._name_color(e["true"]))
+            a, b, c, d = e["path"]
+            pygame.draw.line(self.screen, col, m_to_px(a, b), m_to_px(c, d), 1)
+
+        # figures currently "moving" at the playback time
+        vis = max(120.0, float(REPLAY_SPEEDS[self.replay_speed_idx]))
+        active = 0
+        for e in self.events:
+            if not match(e):
+                continue
+            if e["t"] <= self.replay_time < e["t"] + vis:
+                frac = (self.replay_time - e["t"]) / vis
+                a, b, c, d = e["path"]
+                p = m_to_px(a + (c - a) * frac, b + (d - b) * frac)
+                if e.get("intruder"):
+                    pygame.draw.circle(self.screen, BAD, p, 14, 2)
+                self._kind_glyph(e["kind"], self._name_color(e["true"]), p)
+                active += 1
+        self.screen.set_clip(prev)
+        for i, (sx, sy) in enumerate(SENSOR_POSITIONS_M):
+            p = m_to_px(sx, sy)
+            pygame.draw.rect(self.screen, ACCENT,
+                             pygame.Rect(p[0] - 6, p[1] - 6, 12, 12), border_radius=2)
+
+        # right panel: filters + speed + info
+        self.btn_rp_who.label = "Who: {0}".format(who)
+        self.btn_rp_who.draw(self.screen, self.font, self.btn_rp_who.hit(mp))
+        self.btn_rp_window.label = "Window: {0}".format(
+            REPLAY_WINDOWS[self.replay_window_idx][1])
+        self.btn_rp_window.draw(self.screen, self.font, self.btn_rp_window.hit(mp))
+        self.screen.blit(self.small.render("playback speed:", True, DIM), (600, 212))
+        for i, b in enumerate(self.rp_speed_buttons):
+            b.draw(self.screen, self.small, i == self.replay_speed_idx)
+        self.screen.blit(self.big.render(
+            self._fmt_time(self.replay_time), True, INK), (600, 250))
+        shown = sum(1 for e in self.events
+                    if match(e) and self._replay_start <= e["t"] <= self.replay_time)
+        self.screen.blit(self.font.render(
+            "{0} crossings shown so far   |   {1} moving now".format(shown, active),
+            True, DIM), (600, 284))
+        self.screen.blit(self.small.render(
+            "Figures = live movement. Faint lines = where they went.", True, DIM),
+            (600, 312))
+
+        # scrub bar
+        pygame.draw.rect(self.screen, PANEL, self.rp_scrub, border_radius=4)
+        span = max(1.0, self._replay_end - self._replay_start)
+        frac = (self.replay_time - self._replay_start) / span
+        fill = pygame.Rect(self.rp_scrub.x, self.rp_scrub.y,
+                           int(self.rp_scrub.width * frac), self.rp_scrub.height)
+        pygame.draw.rect(self.screen, ACCENT, fill, border_radius=4)
+        self.screen.blit(self.small.render(
+            self._fmt_time(self._replay_start), True, DIM),
+            (self.rp_scrub.x, self.rp_scrub.bottom + 3))
+        end_lbl = self.small.render(self._fmt_time(self._replay_end), True, DIM)
+        self.screen.blit(end_lbl, (self.rp_scrub.right - end_lbl.get_width(),
+                                   self.rp_scrub.bottom + 3))
+
+        self.btn_rp_play.label = "Pause" if self.replay_playing else "Play"
+        self.btn_rp_play.draw(self.screen, self.font, self.btn_rp_play.hit(mp))
+        self.btn_rp_back.draw(self.screen, self.font, self.btn_rp_back.hit(mp))
+        if not self.events:
+            self.screen.blit(self.font.render(
+                "No movement recorded yet. Run the sim first.", True, DIM),
+                (MAP_RECT.x, MAP_RECT.bottom + 10))
+
     def _draw_charts(self):
         self.screen.fill(BG)
         mp = self._mouse_canvas()
         names = sorted({e["true"] for e in self.events})
         self.screen.blit(self.big.render(
-            "ACCURACY OVER TIME", True, INK), (40, 24))
+            "RECOGNITION ACCURACY OVER TIME", True, INK), (40, 24))
         if not names:
             self.screen.blit(self.font.render(
                 "No crossings recorded yet. Run the sim, then come back.",
-                True, DIM), (40, 80))
+                True, DIM), (40, 84))
             self.btn_c_back.draw(self.screen, self.font, self.btn_c_back.hit(mp))
             return
 
         name = names[self.chart_idx % len(names)]
-        # the AI profile that this character mostly landed in
-        dom, dom_n = None, 0
-        for pid, c in self.profile_truth.items():
-            if c.get(name, 0) > dom_n:
-                dom, dom_n = pid, c[name]
-
-        ev = sorted([e for e in self.events if e["true"] == name],
-                    key=lambda e: e["t"])
+        dom, series = self._chart_series(name)
         tmax = max(e["t"] for e in self.events) or 1.0
-        n_true = len(ev)
+        n_true = len(series)
+        ac = series[-1][2] if series else 0
+        acc = ac / n_true if n_true else 0.0
 
         self.screen.blit(self.font.render(
-            "Character: {0}    (real crossings vs what the AI recognised as its "
-            "profile {1})".format(name, dom or "-"), True, self._name_color(name)),
-            (40, 58))
+            "{0}  -  its real crossings vs the ones the AI tied to its profile "
+            "({1})".format(name, dom or "-"), True, self._name_color(name)),
+            (40, 56))
+        acc_col = GOOD if acc >= 0.85 else (WARN if acc >= 0.5 else BAD)
+        self.screen.blit(self.big.render(
+            "recognised {0} of {1}   =   {2:.0%}   |   final gap {3}".format(
+                ac, n_true, acc, n_true - ac), True, acc_col), (40, 80))
 
-        plot = pygame.Rect(90, 110, 1020, 540)
-        pygame.draw.rect(self.screen, PANEL, plot, border_radius=4)
-        # axes
-        pygame.draw.line(self.screen, DIM, (plot.x, plot.bottom),
-                         (plot.right, plot.bottom), 1)
-        pygame.draw.line(self.screen, DIM, (plot.x, plot.y),
-                         (plot.x, plot.bottom), 1)
+        plot = pygame.Rect(80, 132, 690, 470)
+        pygame.draw.rect(self.screen, (24, 27, 35), plot)
+        pygame.draw.rect(self.screen, GRID, plot, 1)
+        maxc = max(n_true, 1)
 
         def px(t, count):
             x = plot.x + (t / tmax) * plot.width
-            y = plot.bottom - (count / max(n_true, 1)) * (plot.height - 10)
+            y = plot.bottom - (count / maxc) * (plot.height - 8)
             return (int(x), int(y))
 
-        truth_pts, ai_pts = [px(0, 0)], [px(0, 0)]
-        tc = ac = 0
-        for e in ev:
-            tc += 1
-            if e["profile"] == dom:
-                ac += 1
-            truth_pts.append(px(e["t"], tc))
-            ai_pts.append(px(e["t"], ac))
-        if len(truth_pts) > 1:
-            pygame.draw.lines(self.screen, ACCENT, False, truth_pts, 2)
-            pygame.draw.lines(self.screen, GOOD, False, ai_pts, 2)
-
-        # axis labels
-        for frac in (0.0, 0.5, 1.0):
-            tx = plot.x + frac * plot.width
+        for i in range(5):
+            y = plot.bottom - (i / 4) * (plot.height - 8)
+            pygame.draw.line(self.screen, GRID, (plot.x, int(y)),
+                             (plot.right, int(y)), 1)
+            self.screen.blit(self.small.render(str(int(maxc * i / 4)), True, DIM),
+                             (plot.x - 36, int(y) - 7))
+            x = plot.x + (i / 4) * plot.width
+            pygame.draw.line(self.screen, GRID, (int(x), plot.y),
+                             (int(x), plot.bottom), 1)
             self.screen.blit(self.small.render(
-                "{0:.1f}d".format((tmax * frac) / 86400), True, DIM),
-                (int(tx) - 10, plot.bottom + 6))
-        self.screen.blit(self.small.render(str(n_true), True, DIM),
-                         (plot.x - 30, plot.y))
-        self.screen.blit(self.small.render("0", True, DIM),
-                         (plot.x - 16, plot.bottom - 8))
+                "{0:.1f}d".format((tmax * i / 4) / 86400), True, DIM),
+                (int(x) - 12, plot.bottom + 6))
+        self.screen.blit(self.small.render("crossings", True, DIM),
+                         (plot.x - 36, plot.y - 18))
+        self.screen.blit(self.small.render("simulated days ->", True, DIM),
+                         (plot.right - 116, plot.bottom + 24))
 
-        # legend + stats
-        pygame.draw.line(self.screen, ACCENT, (plot.right - 320, plot.y + 16),
-                         (plot.right - 290, plot.y + 16), 3)
-        self.screen.blit(self.small.render("real crossings", True, INK),
-                         (plot.right - 282, plot.y + 9))
-        pygame.draw.line(self.screen, GOOD, (plot.right - 320, plot.y + 36),
-                         (plot.right - 290, plot.y + 36), 3)
-        self.screen.blit(self.small.render("recognised by AI", True, INK),
-                         (plot.right - 282, plot.y + 29))
+        truth_pts, ai_pts = [px(0, 0)], [px(0, 0)]
+        for t, tc, a in series:
+            truth_pts.append(px(t, tc))
+            ai_pts.append(px(t, a))
+        if len(truth_pts) > 1:
+            poly = truth_pts + ai_pts[::-1]
+            shade = pygame.Surface((plot.width, plot.height), pygame.SRCALPHA)
+            pygame.draw.polygon(shade, (240, 110, 110, 70),
+                                [(gx - plot.x, gy - plot.y) for gx, gy in poly])
+            self.screen.blit(shade, (plot.x, plot.y))
+            pygame.draw.lines(self.screen, ACCENT, False, truth_pts, 3)
+            pygame.draw.lines(self.screen, GOOD, False, ai_pts, 3)
 
-        acc = ac / n_true if n_true else 0.0
-        last_truth = ev[-1]["t"]
-        ai_times = [e["t"] for e in ev if e["profile"] == dom]
-        msg = "recognised {0}/{1} ({2:.0%}).".format(ac, n_true, acc)
-        if not ai_times:
-            msg += "  Never settled into one profile."
-        elif last_truth - max(ai_times) > 0.05 * tmax:
-            msg += "  CUT OFF: recognition stopped at {0:.1f}d, crossings " \
-                   "continued to {1:.1f}d.".format(
-                       max(ai_times) / 86400, last_truth / 86400)
-        self.screen.blit(self.font.render(msg, True, WARN), (90, plot.bottom + 26))
+        # right panel: legend + stage table (the numbers, replottable)
+        rx = 800
+        pygame.draw.line(self.screen, ACCENT, (rx, 140), (rx + 26, 140), 3)
+        self.screen.blit(self.small.render("real crossings (blue)", True, INK),
+                         (rx + 34, 133))
+        pygame.draw.line(self.screen, GOOD, (rx, 162), (rx + 26, 162), 3)
+        self.screen.blit(self.small.render("recognised by AI (green)", True, INK),
+                         (rx + 34, 155))
+        pygame.draw.rect(self.screen, (240, 110, 110), pygame.Rect(rx, 180, 26, 10))
+        self.screen.blit(self.small.render("gap = real - recognised", True, INK),
+                         (rx + 34, 178))
+
+        self.screen.blit(self.font.render(
+            "Stage values (these numbers reproduce the graph):", True, GOOD),
+            (rx, 214))
         self.screen.blit(self.small.render(
-            "Lines together = accurate. AI line flat while real line climbs = the "
-            "AI lost this identity (split or mislabelled).", True, DIM),
-            (90, plot.bottom + 48))
+            "{0:<11}{1:>6}{2:>6}{3:>6}{4:>7}".format(
+                "time", "real", "AI", "gap", "acc"), True, DIM), (rx, 240))
+        if series:
+            t0, tN = series[0][0], series[-1][0]
+            yy = 260
+            for k in range(1, 9):
+                target = t0 + (tN - t0) * k / 8.0
+                pick = series[0]
+                for s in series:
+                    if s[0] <= target:
+                        pick = s
+                    else:
+                        break
+                _, tc, a = pick
+                self.screen.blit(self.small.render(
+                    "{0:<11}{1:>6}{2:>6}{3:>6}{4:>6.0%}".format(
+                        self._fmt_time(target), tc, a, tc - a,
+                        a / tc if tc else 0.0), True, INK), (rx, yy))
+                yy += 20
+        self.screen.blit(self.small.render(
+            "Save image also writes a chartdata_*.csv with every point.", True, DIM),
+            (rx, 432))
+
+        # plain-language verdict, keyed to the accuracy and last recognised time
+        last_t = series[-1][0] if series else 0
+        last_recog = max([s[0] for i, s in enumerate(series)
+                          if s[2] > (series[i - 1][2] if i else 0)], default=None)
+        if not series or ac == 0:
+            note = "The AI never settled this source into one steady profile."
+        elif last_recog is not None and last_t - last_recog > 0.05 * tmax:
+            note = ("CUT OFF: recognition stopped at {0:.1f} days while crossings "
+                    "continued to {1:.1f} days.".format(
+                        last_recog / 86400, last_t / 86400))
+        elif acc >= 0.9:
+            note = "Lines stay tight together: the AI tracks this source well."
+        elif acc >= 0.6:
+            note = ("Tracks the trend but fragments: {0:.0%} in one profile, the "
+                    "rest split across other profiles of the same source.".format(acc))
+        else:
+            note = ("Heavily fragmented: only {0:.0%} stayed in one profile.".format(
+                acc))
+        self.screen.blit(self.font.render(note, True, WARN), (80, plot.bottom + 42))
 
         self.btn_c_prev.draw(self.screen, self.font, self.btn_c_prev.hit(mp))
         self.btn_c_next.draw(self.screen, self.font, self.btn_c_next.hit(mp))
         self.btn_c_back.draw(self.screen, self.font, self.btn_c_back.hit(mp))
+        self.btn_c_save.draw(self.screen, self.font, self.btn_c_save.hit(mp))
+        if self._img_saved:
+            self.screen.blit(self.small.render(self._img_saved, True, GOOD),
+                             (self.btn_c_save.rect.right + 14, self.btn_c_save.rect.y + 8))
 
     def _draw_map_editor(self):
         self.screen.fill(BG)
@@ -1104,6 +1495,17 @@ class Game:
                 "NOT in the scene yet. Pick a schedule on the right (or 'In scene' / "
                 "'Make cross now') to make it appear.", True, WARN), (40, 56))
 
+        # distinctness warning: too close to another character to tell apart
+        if ch.kind in ("human", "animal"):
+            twin = next((o for o in self.characters if o is not ch
+                         and o.kind == ch.kind
+                         and abs(o.mass_kg - ch.mass_kg) < 8
+                         and abs(o.cadence_hz - ch.cadence_hz) < 0.25), None)
+            if twin is not None:
+                self.screen.blit(self.font.render(
+                    "Warning: very close to {0} in size and pace - the AI will "
+                    "likely merge them.".format(twin.name), True, BAD), (40, 80))
+
         # left: biometrics
         self.screen.blit(self.font.render("Biometrics", True, DIM), (40, 110))
         for s in self.edit_sliders:
@@ -1135,7 +1537,8 @@ class Game:
             self.screen.blit(self.small.render(
                 "Visitor: appears occasionally at any hour.", True, DIM), (ex, 200))
 
-        self.btn_e_away.label = "Away (holiday): {0}".format("ON" if ch.away else "off")
+        self.btn_e_away.label = "Off-site (absent): {0}".format(
+            "ON" if ch.away else "off")
         self.btn_e_away.draw(self.screen, self.font, ch.away or self.btn_e_away.hit(mp))
         self.btn_e_intruder.label = "Tag as intruder: {0}".format(
             "ON" if ch.is_intruder else "off")
@@ -1146,10 +1549,14 @@ class Game:
             "ON" if ch.active else "off")
         self.btn_e_active.draw(self.screen, self.font,
                                ch.active or self.btn_e_active.hit(mp))
+        self.btn_e_inject.draw(self.screen, self.font, self.btn_e_inject.hit(mp))
+        self.screen.blit(self.small.render(
+            "Inject = appears now and crosses for ~1 hour, then leaves.", True, DIM),
+            (ex, 486))
 
         self.screen.blit(self.small.render(
             "The AI is never told any of this. It only ever receives the seismic feed.",
-            True, DIM), (ex, 456))
+            True, DIM), (ex, 510))
 
         self.btn_e_done.draw(self.screen, self.font, self.btn_e_done.hit(mp))
         self.btn_e_remove.draw(self.screen, self.font, self.btn_e_remove.hit(mp))
@@ -1278,17 +1685,16 @@ class Game:
         rh, rm, rs = real // 3600, (real % 3600) // 60, real % 60
         realstr = ("{0}h {1:02d}m".format(rh, rm) if rh
                    else "{0}m {1:02d}s".format(rm, rs))
-        night = "" if self._is_awake() else "  (night)"
+        night = " (night)" if not self._is_awake() else ""
         self.screen.blit(self.big.render(
             "Seismic Self-Learning Sandbox", True, INK), (20, 16))
         self.screen.blit(self.font.render(
-            "sim {0}{1}  ({2:.1f} days elapsed)    speed {3}    learned {4}    "
-            "real run {5}".format(
+            "sim {0}{1}  |  {2:.1f} days  |  {3}  |  learned {4}  |  real {5}".format(
                 self._timestr(), night, self.clock_s / 86400.0,
                 SPEED_LABELS[self.speed_idx], learned, realstr),
-            True, DIM), (370, 22))
+            True, DIM), (360, 22))
         self.screen.blit(self.small.render(
-            "F=fullscreen  ESC=quit", True, DIM), (WIN_W - 190, 24))
+            "F=fullscreen  ESC=quit", True, DIM), (WIN_W - 178, 6))
 
     def _surf_rect(self, surf: Surface) -> pygame.Rect:
         sx = MAP_RECT.x + surf.x * SCALE
@@ -1357,6 +1763,14 @@ class Game:
                 pygame.draw.circle(self.screen, BAD, p, 15, 2)
             if c.character.mover:
                 pygame.draw.circle(self.screen, GOLD, (p[0], p[1] - 22), 3)
+        # lingering pings where intruders/unknowns were flagged
+        self.pings = [pg for pg in self.pings if now - pg[2] < 12000]
+        for (gx, gy, born, intr) in self.pings:
+            gp = m_to_px(gx, gy)
+            col = BAD if intr else WARN
+            age = (now - born) / 12000.0
+            pygame.draw.circle(self.screen, col, gp, 5)
+            pygame.draw.circle(self.screen, col, gp, int(7 + age * 18), 2)
         self.screen.set_clip(prev)
         # sensors on top
         for i, (sx, sy) in enumerate(SENSOR_POSITIONS_M):
@@ -1404,15 +1818,19 @@ class Game:
 
         # editing is on its own screen
         self.screen.blit(self.font.render(
-            "Click a character in the roster to open its", True, DIM), (x, 312))
-        self.screen.blit(self.font.render(
-            "editor (biometrics, schedule, holiday, intruder).", True, DIM),
-            (x, 334))
+            "Add a character, then click its name.", True, DIM), (x, 316))
         self.btn_map.draw(self.screen, self.font, self.btn_map.hit(mp))
         self.btn_surf_aware.label = "AI surface-aware: {0}".format(
             "ON" if self.ai_surface_aware else "OFF")
         self.btn_surf_aware.draw(self.screen, self.font,
                                  self.ai_surface_aware or self.btn_surf_aware.hit(mp))
+        self.btn_intruders.draw(self.screen, self.font, self.btn_intruders.hit(mp))
+        self.btn_replay.draw(self.screen, self.font, self.btn_replay.hit(mp))
+        self.btn_lock.label = ("VERIFY MODE: {0} residents locked".format(
+            len(self.locked)) if self.verify_mode
+            else "Lock residents (verify mode)")
+        self.btn_lock.draw(self.screen, self.font,
+                           self.verify_mode or self.btn_lock.hit(mp))
 
         # roster (right)
         rx = x + 300
@@ -1449,17 +1867,18 @@ class Game:
                          pygame.Rect(x, BOTTOM_Y, 700, WIN_H - BOTTOM_Y - 12),
                          border_radius=6)
         self.screen.blit(self.big.render(
-            "AI database (built blind)", True, INK), (x + 10, BOTTOM_Y + 8))
+            "AI database (built blind)", True, INK), (x + 10, BOTTOM_Y + 6))
         enrolled = self.memory.enrolled_profiles()
         tentative = self.memory.tentative_profiles()
         caught = self.intrusions_caught
         fa = max(0, len(self.flagged) - caught)
-        self.screen.blit(self.font.render(
-            "enrolled {0}  tentative {1}   |   intrusions {2}/{3}  false {4}".format(
+        self.screen.blit(self.small.render(
+            "enrolled {0}   tentative {1}   |   intrusions caught {2}/{3}   "
+            "false alarms {4}".format(
                 len(enrolled), len(tentative), caught, self.true_intrusions, fa),
-            True, DIM), (x + 250, BOTTOM_Y + 12))
+            True, DIM), (x + 12, BOTTOM_Y + 32))
 
-        yy = BOTTOM_Y + 36
+        yy = BOTTOM_Y + 52
         for p in enrolled[:5]:
             counts = self.profile_truth.get(p.profile_id, Counter())
             total = sum(counts.values())
@@ -1472,7 +1891,7 @@ class Game:
             self.screen.blit(self.font.render(
                 "{0}  {1:>3} obs  ->  {2}  ({3:.0%} pure)".format(
                     p.profile_id, p.count, dom, purity), True, col), (x + 14, yy))
-            yy += 20
+            yy += 18
         if tentative:
             self.screen.blit(self.small.render(
                 "tentative: " + ", ".join(t.profile_id for t in tentative[:8]),
@@ -1519,6 +1938,17 @@ class Game:
             return self._handle_map(event)
         if self.mode == "charts":
             return self._handle_charts(event)
+        if self.mode == "replay":
+            return self._handle_replay(event)
+        if self.mode == "intruders":
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                self.mode = "sim"
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self.btn_i_back.hit(event.pos):
+                    self.mode = "sim"
+                elif self.btn_i_save.hit(event.pos):
+                    self._save_canvas_image("intruder_map")
+            return True
         return self._handle_sim(event)
 
     def _handle_map(self, event):
@@ -1605,6 +2035,8 @@ class Game:
                 ch.is_intruder = not ch.is_intruder
             elif self.btn_e_cross.hit(p):
                 self._force_cross(ch)
+            elif self.btn_e_inject.hit(p):
+                self._inject_intruder(ch)
             elif self.btn_e_active.hit(p):
                 ch.active = not ch.active
                 if ch.active:
@@ -1660,6 +2092,36 @@ class Game:
                 return False
         return True
 
+    def _handle_replay(self, event):
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.mode = "sim"
+            elif event.key == pygame.K_SPACE:
+                self.replay_playing = not self.replay_playing
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            p = event.pos
+            if self.btn_rp_back.hit(p):
+                self.mode = "sim"
+            elif self.btn_rp_play.hit(p):
+                if self.replay_time >= self._replay_end:
+                    self.replay_time = self._replay_start
+                self.replay_playing = not self.replay_playing
+            elif self.btn_rp_who.hit(p):
+                self.replay_who_idx = (self.replay_who_idx + 1) % len(self._who_options())
+            elif self.btn_rp_window.hit(p):
+                self.replay_window_idx = (self.replay_window_idx + 1) % len(REPLAY_WINDOWS)
+                self._replay_start = self._replay_window_start()
+                self.replay_time = max(self.replay_time, self._replay_start)
+            elif self.rp_scrub.collidepoint(p):
+                frac = (p[0] - self.rp_scrub.x) / max(1, self.rp_scrub.width)
+                span = self._replay_end - self._replay_start
+                self.replay_time = self._replay_start + max(0.0, min(1.0, frac)) * span
+            else:
+                for i, b in enumerate(self.rp_speed_buttons):
+                    if b.hit(p):
+                        self.replay_speed_idx = i
+        return True
+
     def _handle_charts(self, event):
         names = sorted({e["true"] for e in self.events})
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
@@ -1672,6 +2134,11 @@ class Game:
                 self.chart_idx = (self.chart_idx - 1) % len(names)
             elif self.btn_c_next.hit(event.pos) and names:
                 self.chart_idx = (self.chart_idx + 1) % len(names)
+            elif self.btn_c_save.hit(event.pos) and names:
+                nm = names[self.chart_idx % len(names)]
+                png = self._save_canvas_image("chart_" + nm)
+                data = self._save_chart_data(nm)
+                self._img_saved = "saved sessions/{0} + {1}".format(png, data)
         return True
 
     def _handle_history(self, event):
@@ -1711,6 +2178,20 @@ class Game:
             return
         if self.btn_surf_aware.hit(pos):
             self.ai_surface_aware = not self.ai_surface_aware
+            return
+        if self.btn_intruders.hit(pos):
+            self.mode = "intruders"
+            return
+        if self.btn_replay.hit(pos):
+            self._enter_replay()
+            return
+        if self.btn_lock.hit(pos):
+            if self.verify_mode:
+                self.verify_mode = False
+                self.locked = []
+                self._log("verification OFF (back to blind learning)", DIM)
+            else:
+                self._lock_residents()
             return
         if self.btn_weather.hit(pos):
             self.env = next_preset(self.env.key)

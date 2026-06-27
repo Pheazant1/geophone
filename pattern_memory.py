@@ -36,7 +36,7 @@ feature stream. The seismic feature extraction that feeds it lives in
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -261,6 +261,24 @@ class PatternMemory:
                 if changed:
                     break
         return merges
+
+    def prune(self, now_s: float, tentative_idle_s: float) -> List[str]:
+        """Retire tentative profiles not seen for a long time (one-off noise).
+
+        A signature seen once or twice and never again is just noise cluttering
+        memory. After ``tentative_idle_s`` with no new sighting, a still-tentative
+        profile is dropped. Enrolled profiles are kept (they are confirmed
+        regulars). Returns the ids removed.
+        """
+        removed: List[str] = []
+        keep: List[Profile] = []
+        for p in self.profiles:
+            if not p.enrolled and (now_s - p.last_seen_s) > tentative_idle_s:
+                removed.append(p.profile_id)
+            else:
+                keep.append(p)
+        self.profiles = keep
+        return removed
 
     # -- views -------------------------------------------------------------
 

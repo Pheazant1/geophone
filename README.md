@@ -258,6 +258,17 @@ across surfaces, as a calibrated site would) or stays surface-blind (a harder
 test, where the same person can look different on different ground). Target
 knowledge, who is crossing and when, is never shared either way.
 
+Several review and security tools sit alongside the sandbox. The map editor can
+paint an ignore zone (for example the house interior) so activity localised
+inside it is dropped and only the grounds are watched. "Lock residents" snapshots
+the learned residents and switches to a verification mode, where any crossing
+that matches no known resident is flagged as an intruder, which sidesteps the
+need to tell similar residents apart. An intruder map plots every flagged
+detection with its time and place, and a movement-replay screen plays back where
+anyone (or just the intruder, or the last seven days of everyone) moved, with a
+scrub bar and speed control. Each character also carries an individual gait
+fingerprint, and the editor warns when two are too alike to be separable.
+
 Ending the run (Escape, or the End button) shows a session report: the database
 of regulars the system learned, the activity it flagged as novel or one-off, the
 run statistics, detection metrics (intrusion precision, recall and F1, profile
